@@ -1,0 +1,745 @@
+import "dotenv/config";
+import crypto from "node:crypto";
+import bcrypt from "bcryptjs";
+import cookieParser from "cookie-parser";
+import cors from "cors";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import helmet from "helmet";
+import { OAuth2Client } from "google-auth-library";
+import { z } from "zod";
+import {
+  Prisma,
+  PrismaClient,
+  EventStatus,
+  OrderStatus,
+  PaymentStatus,
+  PaymentMethod,
+  ReservationStatus,
+  TicketStatus,
+  UserRole,
+  UserStatus,
+} from "@prisma/client";
+
+const prisma = new PrismaClient();
+const app = express();
+const port = Number(process.env.API_PORT ?? 4000);
+const isProduction = process.env.NODE_ENV === "production";
+const sessionCookie = "balada_session";
+const webhookSecret = process.env.PAYMENT_WEBHOOK_SECRET;
+const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173";
+const googleClientId = process.env.GOOGLE_CLIENT_ID;
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+const googleRedirectUri =
+  process.env.GOOGLE_REDIRECT_URI ??
+  `http://localhost:${port}/api/auth/google/callback`;
+const googleClient = new OAuth2Client(
+  googleClientId,
+  googleClientSecret,
+  googleRedirectUri,
+);
+
+app.use(helmet());
+app.use(
+  cors({
+    origin: frontendOrigin,
+    credentials: true,
+  }),
+);
+app.use(express.json({ limit: "100kb" }));
+app.use(cookieParser());
+
+const hash = (value: string) =>
+  crypto.createHash("sha256").update(value).digest("hex");
+const newToken = () => crypto.randomBytes(32).toString("hex");
+const publicUser = (user: {
+  id: string;
+  name: string;
+  email: string;
+  role: UserRole;
+}) => ({ id: user.id, name: user.name, email: user.email, role: user.role });
+
+type AuthRequest = Request & { user?: { id: string; role: UserRole } };
+async function authenticate(
+  request: AuthRequest,
+  response: Response,
+  next: NextFunction,
+) {
+  const rawToken = request.cookies[sessionCookie] as string | undefined;
+  if (!rawToken)
+    return response.status(401).json({ error: "Autenticação necessária." });
+  const session = await prisma.sessions.findFirst({
+    where: { token: hash(rawToken), expires_at: { gt: new Date() } },
+    select: { user_id: true, user: { select: { role: true, status: true } } },
+  });
+  if (!session || session.user.status !== UserStatus.ACTIVE)
+    return response.status(401).json({ error: "Sessão inválida ou expirada." });
+  request.user = { id: session.user_id, role: session.user.role };
+  return next();
+}
+function requireRole(...roles: UserRole[]) {
+  return (request: AuthRequest, response: Response, next: NextFunction) => {
+    if (!request.user || !roles.includes(request.user.role))
+      return response.status(403).json({ error: "Permissão insuficiente." });
+    return next();
+  };
+}
+function setSession(response: Response, userId: string) {
+  const rawToken = newToken();
+  void prisma.sessions.create({
+    data: {
+      user_id: userId,
+      token: hash(rawToken),
+      expires_at: new Date(Date.now() + 1000 * 60 * 60 * 24 * 30),
+    },
+  });
+  response.cookie(sessionCookie, rawToken, {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: "lax",
+    maxAge: 1000 * 60 * 60 * 24 * 30,
+    path: "/",
+  });
+}
+
+const registerSchema = z.object({
+  name: z.string().trim().min(2).max(150),
+  email: z
+    .string()
+    .email()
+    .max(255)
+    .transform((value) => value.toLowerCase()),
+  phone: z.string().trim().min(8).max(30).optional(),
+  password: z.string().min(8).max(72),
+});
+const loginSchema = z.object({
+  email: z
+    .string()
+    .email()
+    .transform((value) => value.toLowerCase()),
+  password: z.string().min(1).max(72),
+});
+const reservationSchema = z.object({
+  eventId: z.string().uuid(),
+  paymentMethod: z
+    .enum(["PIX", "CREDIT_CARD", "DEBIT_CARD", "OTHER"])
+    .default("PIX"),
+  items: z
+    .array(
+      z.object({
+        ticketTypeId: z.string().uuid(),
+        quantity: z.number().int().min(1).max(5),
+      }),
+    )
+    .min(1)
+    .max(20),
+});
+
+app.get("/api/health", (_request, response) =>
+  response.json({ ok: true, service: "balada-api" }),
+);
+app.get("/api/auth/google", (_request, response) => {
+  if (!googleClientId || !googleClientSecret)
+    return response
+      .status(503)
+      .json({ error: "Login Google ainda não configurado." });
+  return response.redirect(
+    googleClient.generateAuthUrl({
+      access_type: "offline",
+      scope: ["openid", "email", "profile"],
+      prompt: "select_account",
+    }),
+  );
+});
+app.get("/api/auth/google/callback", async (request, response, next) => {
+  try {
+    if (
+      !googleClientId ||
+      !googleClientSecret ||
+      typeof request.query.code !== "string"
+    )
+      return response.redirect(
+        `${frontendOrigin}/login?error=google_unavailable`,
+      );
+    const { tokens } = await googleClient.getToken(request.query.code);
+    if (!tokens.id_token)
+      return response.redirect(`${frontendOrigin}/login?error=google_invalid`);
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: googleClientId,
+    });
+    const profile = ticket.getPayload();
+    if (!profile?.sub || !profile.email || !profile.name)
+      return response.redirect(`${frontendOrigin}/login?error=google_profile`);
+    const googleEmail = profile.email.toLowerCase();
+    const user = await prisma.$transaction(async (tx) => {
+      const account = await tx.user_accounts.findFirst({
+        where: { provider: "GOOGLE", provider_account_id: profile.sub },
+        select: { user: true },
+      });
+      if (account) return account.user;
+      const existingUser = await tx.users.findUnique({
+        where: { email: googleEmail },
+      });
+      if (existingUser) {
+        await tx.user_accounts.create({
+          data: {
+            user_id: existingUser.id,
+            provider: "GOOGLE",
+            provider_account_id: profile.sub,
+            provider_email: profile.email,
+          },
+        });
+        return tx.users.update({
+          where: { id: existingUser.id },
+          data: { avatar_url: profile.picture, email_verified_at: new Date() },
+        });
+      }
+      return tx.users.upsert({
+        where: { email: googleEmail },
+        update: {
+          name: profile.name!,
+          avatar_url: profile.picture,
+          email_verified_at: new Date(),
+        },
+        create: {
+          name: profile.name!,
+          email: profile.email!.toLowerCase(),
+          avatar_url: profile.picture,
+          status: UserStatus.ACTIVE,
+          email_verified_at: new Date(),
+          accounts: {
+            create: {
+              provider: "GOOGLE",
+              provider_account_id: profile.sub,
+              provider_email: profile.email,
+            },
+          },
+        },
+      });
+    });
+    setSession(response, user.id);
+    return response.redirect(`${frontendOrigin}/eventos`);
+  } catch (error) {
+    return next(error);
+  }
+});
+app.post("/api/auth/register", async (request, response, next) => {
+  try {
+    const input = registerSchema.parse(request.body);
+    const exists = await prisma.users.findUnique({
+      where: { email: input.email },
+    });
+    if (exists)
+      return response
+        .status(409)
+        .json({ error: "Este e-mail já está cadastrado." });
+    const user = await prisma.users.create({
+      data: {
+        name: input.name,
+        email: input.email,
+        phone: input.phone,
+        password_hash: await bcrypt.hash(input.password, 12),
+        status: UserStatus.ACTIVE,
+        email_verified_at: new Date(),
+      },
+    });
+    setSession(response, user.id);
+    return response.status(201).json({ user: publicUser(user) });
+  } catch (error) {
+    return next(error);
+  }
+});
+app.post("/api/auth/login", async (request, response, next) => {
+  try {
+    const input = loginSchema.parse(request.body);
+    const user = await prisma.users.findUnique({
+      where: { email: input.email },
+    });
+    if (
+      !user ||
+      !user.password_hash ||
+      !(await bcrypt.compare(input.password, user.password_hash))
+    )
+      return response.status(401).json({ error: "E-mail ou senha inválidos." });
+    if (user.status !== UserStatus.ACTIVE)
+      return response.status(403).json({ error: "Conta indisponível." });
+    setSession(response, user.id);
+    return response.json({ user: publicUser(user) });
+  } catch (error) {
+    return next(error);
+  }
+});
+app.post(
+  "/api/auth/logout",
+  authenticate,
+  async (request: AuthRequest, response, next) => {
+    try {
+      const rawToken = request.cookies[sessionCookie] as string;
+      await prisma.sessions.deleteMany({ where: { token: hash(rawToken) } });
+      response.clearCookie(sessionCookie, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: "lax",
+        path: "/",
+      });
+      return response.status(204).send();
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+app.get(
+  "/api/auth/me",
+  authenticate,
+  async (request: AuthRequest, response, next) => {
+    try {
+      const user = await prisma.users.findUniqueOrThrow({
+        where: { id: request.user!.id },
+        select: { id: true, name: true, email: true, role: true },
+      });
+      return response.json({ user });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+app.get("/api/events", async (_request, response, next) => {
+  try {
+    const events = await prisma.events.findMany({
+      where: { status: EventStatus.PUBLISHED, deleted_at: null },
+      orderBy: { start_at: "asc" },
+      include: {
+        venue: true,
+        ticket_types: {
+          where: { status: "ACTIVE" },
+          select: {
+            id: true,
+            name: true,
+            price: true,
+            service_fee: true,
+            quantity: true,
+            sold_quantity: true,
+            reserved_quantity: true,
+            max_quantity: true,
+          },
+        },
+      },
+    });
+    return response.json({ events });
+  } catch (error) {
+    return next(error);
+  }
+});
+app.get("/api/events/:id", async (request, response, next) => {
+  try {
+    const event = await prisma.events.findFirst({
+      where: {
+        id: request.params.id,
+        status: EventStatus.PUBLISHED,
+        deleted_at: null,
+      },
+      include: {
+        venue: true,
+        artists: { include: { artist: true }, orderBy: { position: "asc" } },
+        ticket_types: { where: { status: "ACTIVE" } },
+      },
+    });
+    if (!event)
+      return response.status(404).json({ error: "Evento não encontrado." });
+    return response.json({ event });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post(
+  "/api/reservations",
+  authenticate,
+  async (request: AuthRequest, response, next) => {
+    try {
+      const input = reservationSchema.parse(request.body);
+      const now = new Date();
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+      const result = await prisma.$transaction(
+        async (tx) => {
+          const event = await tx.events.findFirst({
+            where: {
+              id: input.eventId,
+              status: EventStatus.PUBLISHED,
+              deleted_at: null,
+            },
+            select: { id: true },
+          });
+          if (!event) throw new ApiError(404, "Evento não encontrado.");
+          const requestedTotal = input.items.reduce(
+            (total, item) => total + item.quantity,
+            0,
+          );
+          const [pendingReservations, activeOrders] = await Promise.all([
+            tx.reservations.findMany({
+              where: {
+                user_id: request.user!.id,
+                event_id: input.eventId,
+                status: ReservationStatus.PENDING,
+                expires_at: { gt: now },
+              },
+              include: { items: true },
+            }),
+            tx.orders.findMany({
+              where: {
+                user_id: request.user!.id,
+                event_id: input.eventId,
+                status: { in: [OrderStatus.PENDING, OrderStatus.PAID] },
+              },
+              include: { items: true },
+            }),
+          ]);
+          const alreadyHeld = pendingReservations
+            .flatMap((reservation) => reservation.items)
+            .reduce((total, item) => total + item.quantity, 0);
+          const alreadyBought = activeOrders
+            .flatMap((order) => order.items)
+            .reduce((total, item) => total + item.quantity, 0);
+          if (alreadyHeld + alreadyBought + requestedTotal > 5)
+            throw new ApiError(
+              409,
+              "O limite de 5 ingressos por evento foi atingido.",
+            );
+          const lockedTypes = await tx.$queryRaw<
+            Array<{
+              id: string;
+              price: Prisma.Decimal;
+              service_fee: Prisma.Decimal;
+              quantity: number;
+              sold_quantity: number;
+              reserved_quantity: number;
+            }>
+          >(
+            Prisma.sql`SELECT id, price, service_fee, quantity, sold_quantity, reserved_quantity FROM ticket_types WHERE id IN (${Prisma.join(input.items.map((item) => Prisma.sql`${item.ticketTypeId}::uuid`))}) AND event_id = ${input.eventId}::uuid AND status = 'ACTIVE' FOR UPDATE`,
+          );
+          if (lockedTypes.length !== input.items.length)
+            throw new ApiError(400, "Um dos ingressos não está disponível.");
+          const byId = new Map(
+            lockedTypes.map((ticket) => [ticket.id, ticket]),
+          );
+          let subtotal = new Prisma.Decimal(0);
+          const reservationItems = input.items.map((item) => {
+            const ticket = byId.get(item.ticketTypeId)!;
+            const available =
+              ticket.quantity - ticket.sold_quantity - ticket.reserved_quantity;
+            if (available < item.quantity)
+              throw new ApiError(
+                409,
+                "Quantidade indisponível para um dos ingressos.",
+              );
+            const total = ticket.price.mul(item.quantity);
+            subtotal = subtotal.add(total);
+            return {
+              ticket_type_id: ticket.id,
+              quantity: item.quantity,
+              unit_price: ticket.price,
+              total_price: total,
+            };
+          });
+          const reservation = await tx.reservations.create({
+            data: {
+              user_id: request.user!.id,
+              event_id: input.eventId,
+              expires_at: expiresAt,
+              items: { create: reservationItems },
+            },
+          });
+          for (const item of input.items) {
+            await tx.ticket_types.update({
+              where: { id: item.ticketTypeId },
+              data: { reserved_quantity: { increment: item.quantity } },
+            });
+            await tx.inventory_transactions.create({
+              data: {
+                ticket_type_id: item.ticketTypeId,
+                type: "RESERVATION",
+                quantity: item.quantity,
+                reference_type: "RESERVATION",
+                reference_id: reservation.id,
+              },
+            });
+          }
+          const serviceFee = subtotal.mul(new Prisma.Decimal("0.1"));
+          const order = await tx.orders.create({
+            data: {
+              user_id: request.user!.id,
+              event_id: input.eventId,
+              reservation_id: reservation.id,
+              order_number: `BD-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`,
+              subtotal,
+              service_fee: serviceFee,
+              total: subtotal.add(serviceFee),
+              items: {
+                create: reservationItems.map((item) => ({
+                  ticket_type_id: item.ticket_type_id,
+                  quantity: item.quantity,
+                  unit_price: item.unit_price,
+                  service_fee: serviceFee
+                    .div(requestedTotal)
+                    .mul(item.quantity),
+                  total_price: item.total_price,
+                })),
+              },
+              payments: {
+                create: {
+                  provider: "MOCK",
+                  method: input.paymentMethod as PaymentMethod,
+                  amount: subtotal.add(serviceFee),
+                  currency: "BRL",
+                },
+              },
+            },
+          });
+          return { reservation, order };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+      return response.status(201).json(result);
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+app.post("/api/payments/webhook", async (request, response, next) => {
+  try {
+    if (!webhookSecret || request.header("x-webhook-secret") !== webhookSecret)
+      return response.status(401).json({ error: "Webhook não autorizado." });
+    const payload = z
+      .object({
+        provider: z.string(),
+        externalEventId: z.string(),
+        paymentId: z.string().uuid(),
+        status: z.enum(["PAID", "FAILED", "CANCELLED", "EXPIRED"]),
+      })
+      .parse(request.body);
+    const result = await prisma.$transaction(async (tx) => {
+      const webhook = await tx.payment_webhooks
+        .create({
+          data: {
+            provider: payload.provider,
+            external_event_id: payload.externalEventId,
+            event_type: "payment.updated",
+            payload: request.body,
+          },
+        })
+        .catch((error: unknown) => {
+          if (
+            error instanceof Prisma.PrismaClientKnownRequestError &&
+            error.code === "P2002"
+          )
+            return null;
+          throw error;
+        });
+      if (!webhook) return { duplicate: true };
+      const payment = await tx.payments.findUnique({
+        where: { id: payload.paymentId },
+        include: { order: { include: { reservation: true, items: true } } },
+      });
+      if (!payment) throw new ApiError(404, "Pagamento não encontrado.");
+      const status = payload.status as PaymentStatus;
+      await tx.payments.update({
+        where: { id: payment.id },
+        data: {
+          status,
+          paid_at: status === PaymentStatus.PAID ? new Date() : null,
+        },
+      });
+      if (
+        status !== PaymentStatus.PAID ||
+        payment.order.status === OrderStatus.PAID
+      ) {
+        await tx.payment_webhooks.update({
+          where: { id: webhook.id },
+          data: { processed: true, processed_at: new Date() },
+        });
+        return { duplicate: false, status };
+      }
+      await tx.orders.update({
+        where: { id: payment.order_id },
+        data: { status: OrderStatus.PAID, paid_at: new Date() },
+      });
+      if (payment.order.reservation)
+        await tx.reservations.update({
+          where: { id: payment.order.reservation.id },
+          data: { status: ReservationStatus.CONFIRMED },
+        });
+      for (const item of payment.order.items) {
+        await tx.ticket_types.update({
+          where: { id: item.ticket_type_id },
+          data: {
+            sold_quantity: { increment: item.quantity },
+            reserved_quantity: { decrement: item.quantity },
+          },
+        });
+        await tx.inventory_transactions.create({
+          data: {
+            ticket_type_id: item.ticket_type_id,
+            type: "SALE",
+            quantity: item.quantity,
+            reference_type: "ORDER",
+            reference_id: payment.order_id,
+          },
+        });
+        for (let index = 0; index < item.quantity; index += 1) {
+          const token = newToken();
+          await tx.tickets.create({
+            data: {
+              order_id: payment.order_id,
+              order_item_id: item.id,
+              user_id: payment.order.user_id,
+              event_id: payment.order.event_id,
+              ticket_type_id: item.ticket_type_id,
+              code: `TKT-${crypto.randomBytes(6).toString("hex").toUpperCase()}`,
+              qr_token_hash: hash(token),
+              status: TicketStatus.ACTIVE,
+            },
+          });
+        }
+      }
+      await tx.payment_webhooks.update({
+        where: { id: webhook.id },
+        data: { processed: true, processed_at: new Date() },
+      });
+      return { duplicate: false, status: "PAID" };
+    });
+    return response.json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get(
+  "/api/tickets",
+  authenticate,
+  async (request: AuthRequest, response, next) => {
+    try {
+      const tickets = await prisma.tickets.findMany({
+        where: { user_id: request.user!.id },
+        orderBy: { issued_at: "desc" },
+        include: {
+          event: {
+            select: {
+              name: true,
+              start_at: true,
+              venue: { select: { name: true, city: true } },
+            },
+          },
+          ticket_type: { select: { name: true } },
+          order: { select: { order_number: true } },
+        },
+      });
+      return response.json({ tickets });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+const validationSchema = z.object({
+  token: z.string().min(20).max(200),
+  eventId: z.string().uuid(),
+  deviceIdentifier: z.string().max(255).optional(),
+});
+app.post(
+  "/api/tickets/validate",
+  authenticate,
+  requireRole(UserRole.STAFF, UserRole.ADMIN),
+  async (request: AuthRequest, response, next) => {
+    try {
+      const input = validationSchema.parse(request.body);
+      const result = await prisma.$transaction(async (tx) => {
+        const ticket = await tx.$queryRaw<
+          Array<{ id: string; status: TicketStatus; event_id: string }>
+        >(
+          Prisma.sql`SELECT id, status, event_id FROM tickets WHERE qr_token_hash = ${hash(input.token)} FOR UPDATE`,
+        );
+        const found = ticket[0];
+        if (!found) return { result: "INVALID" };
+        if (found.event_id !== input.eventId) return { result: "INVALID" };
+        if (found.status !== TicketStatus.ACTIVE) {
+          await tx.ticket_validations.create({
+            data: {
+              ticket_id: found.id,
+              event_id: input.eventId,
+              staff_user_id: request.user!.id,
+              result:
+                found.status === TicketStatus.USED
+                  ? "ALREADY_USED"
+                  : found.status,
+              device_identifier: input.deviceIdentifier,
+            },
+          });
+          return {
+            result:
+              found.status === TicketStatus.USED
+                ? "ALREADY_USED"
+                : found.status,
+          };
+        }
+        await tx.tickets.update({
+          where: { id: found.id },
+          data: { status: TicketStatus.USED, used_at: new Date() },
+        });
+        await tx.ticket_validations.create({
+          data: {
+            ticket_id: found.id,
+            event_id: input.eventId,
+            staff_user_id: request.user!.id,
+            result: "VALID",
+            device_identifier: input.deviceIdentifier,
+          },
+        });
+        return { result: "VALID" };
+      });
+      return response.json(result);
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+class ApiError extends Error {
+  constructor(
+    public statusCode: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+app.use(
+  (
+    error: unknown,
+    _request: Request,
+    response: Response,
+    _next: NextFunction,
+  ) => {
+    if (error instanceof z.ZodError)
+      return response.status(400).json({
+        error: "Dados inválidos.",
+        fields: error.flatten().fieldErrors,
+      });
+    if (error instanceof ApiError)
+      return response.status(error.statusCode).json({ error: error.message });
+    console.error(error);
+    return response.status(500).json({ error: "Erro interno do servidor." });
+  },
+);
+const server = app.listen(port, () =>
+  console.log(`balada API em http://localhost:${port}`),
+);
+const shutdown = async () => {
+  server.close();
+  await prisma.$disconnect();
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
