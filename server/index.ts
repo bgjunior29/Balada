@@ -26,11 +26,16 @@ import {
 
 const prisma = new PrismaClient();
 const app = express();
-const port = Number(process.env.API_PORT ?? 4000);
+const port = Number(process.env.PORT ?? process.env.API_PORT ?? 4100);
 const isProduction = process.env.NODE_ENV === "production";
 const sessionCookie = "balada_session";
 const webhookSecret = process.env.PAYMENT_WEBHOOK_SECRET;
-const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173";
+const frontendOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:5180";
+const ticketQrSecret =
+  process.env.TICKET_QR_SECRET ??
+  (isProduction ? undefined : "balada-dev-only-qr-secret");
+if (!ticketQrSecret)
+  throw new Error("TICKET_QR_SECRET precisa estar configurada em produção.");
 const googleClientId = process.env.GOOGLE_CLIENT_ID;
 const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
 const googleRedirectUri =
@@ -55,6 +60,18 @@ app.use(cookieParser());
 const hash = (value: string) =>
   crypto.createHash("sha256").update(value).digest("hex");
 const newToken = () => crypto.randomBytes(32).toString("hex");
+// O token do QR é derivado do código do ingresso: o banco guarda só o hash,
+// mas a API consegue recriá-lo para mostrar ao dono do ingresso.
+const qrToken = (ticketCode: string) =>
+  crypto.createHmac("sha256", ticketQrSecret).update(ticketCode).digest("hex");
+// Em produção o front (Vercel) e a API (Railway) ficam em sites diferentes,
+// então o cookie precisa de SameSite=None para ir junto nas chamadas fetch.
+const cookieOptions = {
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: isProduction ? ("none" as const) : ("lax" as const),
+  path: "/",
+};
 const publicUser = (user: {
   id: string;
   name: string;
@@ -87,9 +104,9 @@ function requireRole(...roles: UserRole[]) {
     return next();
   };
 }
-function setSession(response: Response, userId: string) {
+async function setSession(response: Response, userId: string) {
   const rawToken = newToken();
-  void prisma.sessions.create({
+  await prisma.sessions.create({
     data: {
       user_id: userId,
       token: hash(rawToken),
@@ -97,11 +114,8 @@ function setSession(response: Response, userId: string) {
     },
   });
   response.cookie(sessionCookie, rawToken, {
-    httpOnly: true,
-    secure: isProduction,
-    sameSite: "lax",
+    ...cookieOptions,
     maxAge: 1000 * 60 * 60 * 24 * 30,
-    path: "/",
   });
 }
 
@@ -185,6 +199,12 @@ app.get("/api/auth/google/callback", async (request, response, next) => {
         where: { email: googleEmail },
       });
       if (existingUser) {
+        // Se o e-mail nunca foi confirmado, alguém pode ter criado a conta com
+        // o e-mail de outra pessoa. O dono real (provado pelo Google) assume a
+        // conta: a senha antiga e as sessões abertas deixam de valer.
+        const takeOver = !existingUser.email_verified_at;
+        if (takeOver)
+          await tx.sessions.deleteMany({ where: { user_id: existingUser.id } });
         await tx.user_accounts.create({
           data: {
             user_id: existingUser.id,
@@ -195,7 +215,11 @@ app.get("/api/auth/google/callback", async (request, response, next) => {
         });
         return tx.users.update({
           where: { id: existingUser.id },
-          data: { avatar_url: profile.picture, email_verified_at: new Date() },
+          data: {
+            avatar_url: profile.picture,
+            email_verified_at: new Date(),
+            ...(takeOver && { password_hash: null }),
+          },
         });
       }
       return tx.users.upsert({
@@ -221,7 +245,7 @@ app.get("/api/auth/google/callback", async (request, response, next) => {
         },
       });
     });
-    setSession(response, user.id);
+    await setSession(response, user.id);
     return response.redirect(`${frontendOrigin}/eventos`);
   } catch (error) {
     return next(error);
@@ -244,10 +268,9 @@ app.post("/api/auth/register", async (request, response, next) => {
         phone: input.phone,
         password_hash: await bcrypt.hash(input.password, 12),
         status: UserStatus.ACTIVE,
-        email_verified_at: new Date(),
       },
     });
-    setSession(response, user.id);
+    await setSession(response, user.id);
     return response.status(201).json({ user: publicUser(user) });
   } catch (error) {
     return next(error);
@@ -267,7 +290,7 @@ app.post("/api/auth/login", async (request, response, next) => {
       return response.status(401).json({ error: "E-mail ou senha inválidos." });
     if (user.status !== UserStatus.ACTIVE)
       return response.status(403).json({ error: "Conta indisponível." });
-    setSession(response, user.id);
+    await setSession(response, user.id);
     return response.json({ user: publicUser(user) });
   } catch (error) {
     return next(error);
@@ -280,12 +303,7 @@ app.post(
     try {
       const rawToken = request.cookies[sessionCookie] as string;
       await prisma.sessions.deleteMany({ where: { token: hash(rawToken) } });
-      response.clearCookie(sessionCookie, {
-        httpOnly: true,
-        secure: isProduction,
-        sameSite: "lax",
-        path: "/",
-      });
+      response.clearCookie(sessionCookie, cookieOptions);
       return response.status(204).send();
     } catch (error) {
       return next(error);
@@ -308,10 +326,18 @@ app.get(
   },
 );
 
+const upcomingEvent = () => ({
+  status: EventStatus.PUBLISHED,
+  deleted_at: null,
+  OR: [
+    { end_at: { gte: new Date() } },
+    { end_at: null, start_at: { gte: new Date() } },
+  ],
+});
 app.get("/api/events", async (_request, response, next) => {
   try {
     const events = await prisma.events.findMany({
-      where: { status: EventStatus.PUBLISHED, deleted_at: null },
+      where: upcomingEvent(),
       orderBy: { start_at: "asc" },
       include: {
         venue: true,
@@ -320,6 +346,7 @@ app.get("/api/events", async (_request, response, next) => {
           select: {
             id: true,
             name: true,
+            description: true,
             price: true,
             service_fee: true,
             quantity: true,
@@ -368,11 +395,7 @@ app.post(
       const result = await prisma.$transaction(
         async (tx) => {
           const event = await tx.events.findFirst({
-            where: {
-              id: input.eventId,
-              status: EventStatus.PUBLISHED,
-              deleted_at: null,
-            },
+            where: { id: input.eventId, ...upcomingEvent() },
             select: { id: true },
           });
           if (!event) throw new ApiError(404, "Evento não encontrado.");
@@ -394,7 +417,7 @@ app.post(
               where: {
                 user_id: request.user!.id,
                 event_id: input.eventId,
-                status: { in: [OrderStatus.PENDING, OrderStatus.PAID] },
+                status: OrderStatus.PAID,
               },
               include: { items: true },
             }),
@@ -418,9 +441,12 @@ app.post(
               quantity: number;
               sold_quantity: number;
               reserved_quantity: number;
+              max_quantity: number;
+              sales_start_at: Date | null;
+              sales_end_at: Date | null;
             }>
           >(
-            Prisma.sql`SELECT id, price, service_fee, quantity, sold_quantity, reserved_quantity FROM ticket_types WHERE id IN (${Prisma.join(input.items.map((item) => Prisma.sql`${item.ticketTypeId}::uuid`))}) AND event_id = ${input.eventId}::uuid AND status = 'ACTIVE' FOR UPDATE`,
+            Prisma.sql`SELECT id, price, service_fee, quantity, sold_quantity, reserved_quantity, max_quantity, sales_start_at, sales_end_at FROM ticket_types WHERE id IN (${Prisma.join(input.items.map((item) => Prisma.sql`${item.ticketTypeId}::uuid`))}) AND event_id = ${input.eventId}::uuid AND status = 'ACTIVE' FOR UPDATE`,
           );
           if (lockedTypes.length !== input.items.length)
             throw new ApiError(400, "Um dos ingressos não está disponível.");
@@ -428,8 +454,19 @@ app.post(
             lockedTypes.map((ticket) => [ticket.id, ticket]),
           );
           let subtotal = new Prisma.Decimal(0);
+          let serviceFee = new Prisma.Decimal(0);
           const reservationItems = input.items.map((item) => {
             const ticket = byId.get(item.ticketTypeId)!;
+            if (
+              (ticket.sales_start_at && ticket.sales_start_at > now) ||
+              (ticket.sales_end_at && ticket.sales_end_at < now)
+            )
+              throw new ApiError(409, "As vendas deste ingresso estão fechadas.");
+            if (item.quantity > ticket.max_quantity)
+              throw new ApiError(
+                409,
+                `Máximo de ${ticket.max_quantity} unidades para este ingresso.`,
+              );
             const available =
               ticket.quantity - ticket.sold_quantity - ticket.reserved_quantity;
             if (available < item.quantity)
@@ -438,8 +475,11 @@ app.post(
                 "Quantidade indisponível para um dos ingressos.",
               );
             const total = ticket.price.mul(item.quantity);
+            const fee = ticket.service_fee.mul(item.quantity);
             subtotal = subtotal.add(total);
+            serviceFee = serviceFee.add(fee);
             return {
+              fee,
               ticket_type_id: ticket.id,
               quantity: item.quantity,
               unit_price: ticket.price,
@@ -451,7 +491,9 @@ app.post(
               user_id: request.user!.id,
               event_id: input.eventId,
               expires_at: expiresAt,
-              items: { create: reservationItems },
+              items: {
+                create: reservationItems.map(({ fee: _fee, ...item }) => item),
+              },
             },
           });
           for (const item of input.items) {
@@ -469,7 +511,6 @@ app.post(
               },
             });
           }
-          const serviceFee = subtotal.mul(new Prisma.Decimal("0.1"));
           const order = await tx.orders.create({
             data: {
               user_id: request.user!.id,
@@ -484,9 +525,7 @@ app.post(
                   ticket_type_id: item.ticket_type_id,
                   quantity: item.quantity,
                   unit_price: item.unit_price,
-                  service_fee: serviceFee
-                    .div(requestedTotal)
-                    .mul(item.quantity),
+                  service_fee: item.fee,
                   total_price: item.total_price,
                 })),
               },
@@ -510,6 +549,72 @@ app.post(
     }
   },
 );
+
+// Devolve ao estoque o que a reserva segurava. O updateMany condicional garante
+// que só uma transação (job de expiração ou webhook) libera a mesma reserva.
+async function releaseReservation(
+  tx: Prisma.TransactionClient,
+  reservationId: string,
+  reservationStatus: ReservationStatus,
+  orderStatus: OrderStatus,
+  paymentStatus: PaymentStatus,
+) {
+  const claimed = await tx.reservations.updateMany({
+    where: { id: reservationId, status: ReservationStatus.PENDING },
+    data: { status: reservationStatus },
+  });
+  if (!claimed.count) return false;
+  const items = await tx.reservation_items.findMany({
+    where: { reservation_id: reservationId },
+  });
+  for (const item of items) {
+    await tx.ticket_types.update({
+      where: { id: item.ticket_type_id },
+      data: { reserved_quantity: { decrement: item.quantity } },
+    });
+    await tx.inventory_transactions.create({
+      data: {
+        ticket_type_id: item.ticket_type_id,
+        type: "RELEASE",
+        quantity: item.quantity,
+        reference_type: "RESERVATION",
+        reference_id: reservationId,
+      },
+    });
+  }
+  await tx.orders.updateMany({
+    where: { reservation_id: reservationId, status: OrderStatus.PENDING },
+    data: { status: orderStatus },
+  });
+  await tx.payments.updateMany({
+    where: {
+      order: { reservation_id: reservationId },
+      status: { in: [PaymentStatus.PENDING, PaymentStatus.PROCESSING] },
+    },
+    data: { status: paymentStatus },
+  });
+  return true;
+}
+async function expireReservations() {
+  const expired = await prisma.reservations.findMany({
+    where: {
+      status: ReservationStatus.PENDING,
+      expires_at: { lte: new Date() },
+    },
+    select: { id: true },
+    take: 100,
+  });
+  for (const reservation of expired)
+    await prisma.$transaction((tx) =>
+      releaseReservation(
+        tx,
+        reservation.id,
+        ReservationStatus.EXPIRED,
+        OrderStatus.EXPIRED,
+        PaymentStatus.EXPIRED,
+      ),
+    );
+}
 
 app.post("/api/payments/webhook", async (request, response, next) => {
   try {
@@ -548,38 +653,70 @@ app.post("/api/payments/webhook", async (request, response, next) => {
       });
       if (!payment) throw new ApiError(404, "Pagamento não encontrado.");
       const status = payload.status as PaymentStatus;
-      await tx.payments.update({
-        where: { id: payment.id },
-        data: {
-          status,
-          paid_at: status === PaymentStatus.PAID ? new Date() : null,
-        },
-      });
-      if (
-        status !== PaymentStatus.PAID ||
-        payment.order.status === OrderStatus.PAID
-      ) {
-        await tx.payment_webhooks.update({
+      const markProcessed = () =>
+        tx.payment_webhooks.update({
           where: { id: webhook.id },
           data: { processed: true, processed_at: new Date() },
         });
+      // Pedido já pago não volta atrás por um evento atrasado de falha.
+      if (payment.order.status === OrderStatus.PAID) {
+        await markProcessed();
+        return { duplicate: false, status: OrderStatus.PAID };
+      }
+      if (status !== PaymentStatus.PAID) {
+        await tx.payments.update({
+          where: { id: payment.id },
+          data: { status, paid_at: null },
+        });
+        if (payment.order.reservation)
+          await releaseReservation(
+            tx,
+            payment.order.reservation.id,
+            ReservationStatus.CANCELLED,
+            status === PaymentStatus.FAILED
+              ? OrderStatus.FAILED
+              : status === PaymentStatus.EXPIRED
+                ? OrderStatus.EXPIRED
+                : OrderStatus.CANCELLED,
+            status,
+          );
+        await markProcessed();
         return { duplicate: false, status };
       }
-      await tx.orders.update({
-        where: { id: payment.order_id },
+      // Marca como pago de forma condicional: dois webhooks PAID simultâneos
+      // (com ids externos diferentes) não emitem ingressos em dobro.
+      const paid = await tx.orders.updateMany({
+        where: { id: payment.order_id, status: { not: OrderStatus.PAID } },
         data: { status: OrderStatus.PAID, paid_at: new Date() },
       });
-      if (payment.order.reservation)
-        await tx.reservations.update({
-          where: { id: payment.order.reservation.id },
-          data: { status: ReservationStatus.CONFIRMED },
-        });
+      if (!paid.count) {
+        await markProcessed();
+        return { duplicate: false, status: OrderStatus.PAID };
+      }
+      await tx.payments.update({
+        where: { id: payment.id },
+        data: { status, paid_at: new Date() },
+      });
+      // Se a reserva já expirou, o estoque reservado já foi devolvido pelo job.
+      const stillReserved = payment.order.reservation
+        ? (
+            await tx.reservations.updateMany({
+              where: {
+                id: payment.order.reservation.id,
+                status: ReservationStatus.PENDING,
+              },
+              data: { status: ReservationStatus.CONFIRMED },
+            })
+          ).count > 0
+        : false;
       for (const item of payment.order.items) {
         await tx.ticket_types.update({
           where: { id: item.ticket_type_id },
           data: {
             sold_quantity: { increment: item.quantity },
-            reserved_quantity: { decrement: item.quantity },
+            ...(stillReserved && {
+              reserved_quantity: { decrement: item.quantity },
+            }),
           },
         });
         await tx.inventory_transactions.create({
@@ -592,7 +729,7 @@ app.post("/api/payments/webhook", async (request, response, next) => {
           },
         });
         for (let index = 0; index < item.quantity; index += 1) {
-          const token = newToken();
+          const code = `TKT-${crypto.randomBytes(6).toString("hex").toUpperCase()}`;
           await tx.tickets.create({
             data: {
               order_id: payment.order_id,
@@ -600,8 +737,8 @@ app.post("/api/payments/webhook", async (request, response, next) => {
               user_id: payment.order.user_id,
               event_id: payment.order.event_id,
               ticket_type_id: item.ticket_type_id,
-              code: `TKT-${crypto.randomBytes(6).toString("hex").toUpperCase()}`,
-              qr_token_hash: hash(token),
+              code,
+              qr_token_hash: hash(qrToken(code)),
               status: TicketStatus.ACTIVE,
             },
           });
@@ -639,7 +776,12 @@ app.get(
           order: { select: { order_number: true } },
         },
       });
-      return response.json({ tickets });
+      return response.json({
+        tickets: tickets.map(({ qr_token_hash: _hash, ...ticket }) => ({
+          ...ticket,
+          qrToken: ticket.status === TicketStatus.ACTIVE ? qrToken(ticket.code) : null,
+        })),
+      });
     } catch (error) {
       return next(error);
     }
@@ -730,6 +872,22 @@ app.use(
       });
     if (error instanceof ApiError)
       return response.status(error.statusCode).json({ error: error.message });
+    // JSON malformado ou corpo grande demais (express.json).
+    if (
+      error instanceof Error &&
+      "status" in error &&
+      typeof error.status === "number" &&
+      error.status < 500
+    )
+      return response.status(error.status).json({ error: "Requisição inválida." });
+    // Conflito de transação Serializable: duas compras disputando o mesmo lote.
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2034"
+    )
+      return response
+        .status(409)
+        .json({ error: "Muita procura agora. Tente novamente." });
     console.error(error);
     return response.status(500).json({ error: "Erro interno do servidor." });
   },
@@ -737,7 +895,14 @@ app.use(
 const server = app.listen(port, () =>
   console.log(`balada API em http://localhost:${port}`),
 );
+const runExpiration = () =>
+  expireReservations().catch((error: unknown) =>
+    console.error("Falha ao expirar reservas:", error),
+  );
+void runExpiration();
+const expirationTimer = setInterval(runExpiration, 60 * 1000);
 const shutdown = async () => {
+  clearInterval(expirationTimer);
   server.close();
   await prisma.$disconnect();
 };

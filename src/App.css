@@ -199,6 +199,8 @@ nav a:hover,
 .hero-art {
   position: relative;
   height: 390px;
+  background:
+    linear-gradient(135deg, #243b78 0%, #192542 55%, #ff765b 160%), var(--dark);
   animation: rise 0.7s 0.12s ease both;
 }
 .hero-art img {
@@ -517,6 +519,7 @@ nav a:hover,
   height: 220px;
   position: relative;
   overflow: hidden;
+  background: linear-gradient(135deg, #263b76, #192542);
 }
 .event-image-wrap img {
   height: 100%;
@@ -773,6 +776,26 @@ footer small {
 }
 .ticket-option > strong {
   font-size: 13px;
+}
+button.ticket-option {
+  width: 100%;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-left: 3px solid transparent;
+  padding-left: 12px;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+button.ticket-option.active {
+  border-left-color: var(--coral);
+}
+button.ticket-option:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 .quantity-row,
 .total-row {
@@ -1159,6 +1182,12 @@ footer small {
   }
   .header-actions {
     gap: 10px;
+  }
+  .header .primary-button.small {
+    max-width: 110px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .profile-chip {
     font-size: 0;

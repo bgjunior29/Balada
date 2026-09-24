@@ -62,8 +62,8 @@ async function main() {
       description: "Uma noite para lembrar.",
       category: "CLUB",
       status: EventStatus.PUBLISHED,
-      start_at: new Date("2026-08-29T22:00:00-03:00"),
-      doors_open_at: new Date("2026-08-29T21:00:00-03:00"),
+      start_at: new Date("2026-12-12T22:00:00-03:00"),
+      doors_open_at: new Date("2026-12-12T21:00:00-03:00"),
       age_rating: "18+",
       published_at: new Date(),
     },
@@ -73,7 +73,7 @@ async function main() {
       event_id: event.id,
       name: "Lote antecipado",
       starts_at: new Date(),
-      ends_at: new Date("2026-08-29T18:00:00-03:00"),
+      ends_at: new Date("2026-12-12T18:00:00-03:00"),
     },
   });
   const ticketType = await prisma.ticket_types.create({

@@ -8,9 +8,10 @@ Configure estas variaveis no servico da Railway:
 
 ```env
 DATABASE_URL=connection-string-do-Neon
-API_PORT=4000
+API_PORT=4100
 FRONTEND_ORIGIN=https://seu-projeto.vercel.app
 PAYMENT_WEBHOOK_SECRET=um-segredo-forte
+TICKET_QR_SECRET=outro-segredo-forte-e-que-nunca-muda
 GOOGLE_CLIENT_ID=seu-client-id.apps.googleusercontent.com
 GOOGLE_CLIENT_SECRET=seu-client-secret
 GOOGLE_REDIRECT_URI=https://sua-api.up.railway.app/api/auth/google/callback

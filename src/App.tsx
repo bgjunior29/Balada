@@ -9,26 +9,57 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
+import { QRCodeSVG } from "qrcode.react";
 import "./App.css";
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? "").replace(/\/$/, "");
 const apiUrl = (path: string) => `${API_BASE}${path}`;
+const brl = (value: number) =>
+  value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+// Lê o corpo como JSON sem quebrar quando a API cai e o proxy devolve HTML.
+const readJson = async <T,>(response: Response): Promise<T | null> => {
+  try {
+    return (await response.json()) as T;
+  } catch {
+    return null;
+  }
+};
 
+type TicketOption = {
+  id?: string;
+  name: string;
+  description: string;
+  price: number;
+  fee: number;
+  maxPerOrder: number;
+};
 type EventItem = {
   id: string;
   title: string;
   venue: string;
+  address?: string;
   city: string;
   date: string;
   day: string;
   month: string;
   time: string;
   category: string;
+  description?: string;
   price: number;
-  ticketTypeId?: string;
+  tickets?: TicketOption[];
   image: string;
   tags: string[];
 };
+const ticketsOf = (event: EventItem): TicketOption[] =>
+  event.tickets ?? [
+    {
+      name: "Entrada antecipada",
+      description: "Acesso à pista",
+      price: event.price,
+      fee: 0,
+      maxPerOrder: 5,
+    },
+  ];
 const events: EventItem[] = [
   {
     id: "sundown",
@@ -176,21 +207,65 @@ const moods = [
 type ApiEvent = {
   id: string;
   name: string;
+  description: string | null;
   category: string | null;
   start_at: string;
   banner_url: string | null;
   thumbnail_url: string | null;
-  venue: { name: string; city: string } | null;
+  venue: {
+    name: string;
+    city: string;
+    state: string | null;
+    address: string | null;
+    number: string | null;
+  } | null;
   ticket_types: Array<{
     id: string;
+    name: string;
+    description: string | null;
     price: string | number;
+    service_fee: string | number;
     quantity: number;
     sold_quantity: number;
     reserved_quantity: number;
+    max_quantity: number;
   }>;
 };
+// O banco guarda a categoria como código (ex.: CLUB); a interface usa rótulos.
+const categoryLabels: Record<string, string> = {
+  CLUB: "Baladas",
+  SHOW: "Shows",
+  PARTY: "Festas",
+  BAR: "Bares",
+  FESTIVAL: "Festivais",
+};
+const sameDay = (a: Date, b: Date) => a.toDateString() === b.toDateString();
+function dateTags(date: Date) {
+  const today = new Date();
+  const saturday = new Date(today);
+  saturday.setDate(today.getDate() + ((6 - today.getDay() + 7) % 7));
+  return [
+    ...(sameDay(date, today) ? ["Hoje"] : []),
+    ...(sameDay(date, saturday) ? ["Sábado"] : []),
+  ];
+}
 function toEventItem(item: ApiEvent, index: number): EventItem {
   const date = new Date(item.start_at);
+  const tickets = item.ticket_types.map((ticket) => ({
+    id: ticket.id,
+    name: ticket.name,
+    description: ticket.description ?? "",
+    price: Number(ticket.price),
+    fee: Number(ticket.service_fee),
+    maxPerOrder: Math.max(
+      0,
+      Math.min(
+        5,
+        ticket.max_quantity,
+        ticket.quantity - ticket.sold_quantity - ticket.reserved_quantity,
+      ),
+    ),
+  }));
   const month = date
     .toLocaleDateString("pt-BR", { month: "short" })
     .replace(".", "")
@@ -199,7 +274,12 @@ function toEventItem(item: ApiEvent, index: number): EventItem {
     id: item.id,
     title: item.name,
     venue: item.venue?.name ?? "Local a confirmar",
-    city: item.venue ? `${item.venue.city}, SP` : "São Paulo, SP",
+    address: item.venue?.address
+      ? [item.venue.address, item.venue.number].filter(Boolean).join(", ")
+      : undefined,
+    city: item.venue
+      ? [item.venue.city, item.venue.state].filter(Boolean).join(", ")
+      : "Local a confirmar",
     date: date
       .toLocaleDateString("pt-BR", {
         day: "2-digit",
@@ -214,16 +294,21 @@ function toEventItem(item: ApiEvent, index: number): EventItem {
       hour: "2-digit",
       minute: "2-digit",
     }),
-    category: item.category ?? "Eventos",
-    price: Number(item.ticket_types[0]?.price ?? 0),
-    ticketTypeId: item.ticket_types[0]?.id,
-    tags: ["Sábado"],
+    category: item.category
+      ? (categoryLabels[item.category] ?? item.category)
+      : "Eventos",
+    description: item.description ?? undefined,
+    price: tickets.length ? Math.min(...tickets.map((t) => t.price)) : 0,
+    tickets,
+    tags: dateTags(date),
     image:
       item.banner_url ??
       item.thumbnail_url ??
       events[index % events.length].image,
   };
 }
+// Só cai na curadoria de demonstração se a API estiver fora do ar; uma lista
+// vazia vinda da API é mostrada como vazia, não como eventos fictícios.
 function useCatalog() {
   const [items, setItems] = useState<EventItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -231,9 +316,10 @@ function useCatalog() {
   useEffect(() => {
     fetch(apiUrl("/api/events"))
       .then(async (response) => {
-        if (!response.ok)
-          throw new Error("Não foi possível carregar os eventos.");
-        const data = (await response.json()) as { events: ApiEvent[] };
+        const data = response.ok
+          ? await readJson<{ events: ApiEvent[] }>(response)
+          : null;
+        if (!data) throw new Error("Não foi possível carregar os eventos.");
         setItems(data.events.map(toEventItem));
       })
       .catch((requestError: unknown) =>
@@ -245,22 +331,50 @@ function useCatalog() {
       )
       .finally(() => setLoading(false));
   }, []);
-  return { items, loading, error };
+  return { catalog: error ? events : items, loading, error };
 }
 
 type SessionUser = { id: string; name: string; email: string; role: string };
-
-function Header() {
+function useSession() {
   const [user, setUser] = useState<SessionUser | null>(null);
-  const navigate = useNavigate();
+  const [loading, setLoading] = useState(true);
   useEffect(() => {
     fetch(apiUrl("/api/auth/me"), { credentials: "include" })
-      .then((response) => (response.ok ? response.json() : null))
-      .then((data: { user?: SessionUser } | null) =>
-        setUser(data?.user ?? null),
+      .then((response) =>
+        response.ok ? readJson<{ user?: SessionUser }>(response) : null,
       )
-      .catch(() => setUser(null));
+      .then((data) => setUser(data?.user ?? null))
+      .catch(() => setUser(null))
+      .finally(() => setLoading(false));
   }, []);
+  return { user, loading };
+}
+function PrivateNotice({ loading, title }: { loading: boolean; title: string }) {
+  return (
+    <>
+      <Header />
+      <main className="page-content profile-page max-w-5xl mx-auto px-5 sm:px-8">
+        <div className="empty-state">
+          <span className="kicker">Área privada</span>
+          {loading ? (
+            <h1>Carregando...</h1>
+          ) : (
+            <>
+              <h1>{title}</h1>
+              <Link to="/login" className="primary-button">
+                Entrar <span>→</span>
+              </Link>
+            </>
+          )}
+        </div>
+      </main>
+    </>
+  );
+}
+
+function Header() {
+  const { user } = useSession();
+  const navigate = useNavigate();
   return (
     <header className="header">
       <Link to="/" className="brand">
@@ -269,7 +383,7 @@ function Header() {
       </Link>
       <nav>
         <Link to="/eventos">Descobrir</Link>
-        <a href="#categorias">Categorias</a>
+        <a href="/#categorias">Categorias</a>
         {user && <Link to="/meus-ingressos">Meus ingressos</Link>}
       </nav>
       <div className="header-actions">
@@ -306,7 +420,13 @@ function EventCard({ event, index = 0 }: { event: EventItem; index?: number }) {
       style={{ animationDelay: `${index * 70}ms` }}
     >
       <Link to={`/eventos/${event.id}`} className="event-image-wrap">
-        <img src={event.image} alt={event.title} />
+        <img
+          src={event.image}
+          alt={event.title}
+          onError={(error) => {
+            error.currentTarget.style.display = "none";
+          }}
+        />
         <span className="event-date">
           <strong>{event.day}</strong>
           {event.month}
@@ -325,7 +445,7 @@ function EventCard({ event, index = 0 }: { event: EventItem; index?: number }) {
         </p>
         <div className="event-card-footer">
           <span>
-            A partir de <strong>R$ {event.price},00</strong>
+            A partir de <strong>{brl(event.price)}</strong>
           </span>
           <Link to={`/eventos/${event.id}`} className="arrow-link">
             Ver evento <span>↗</span>
@@ -337,10 +457,9 @@ function EventCard({ event, index = 0 }: { event: EventItem; index?: number }) {
 }
 
 function Home() {
-  const { items, loading, error } = useCatalog();
-  const catalog = items.length ? items : events;
+  const { catalog, loading, error } = useCatalog();
   const [mood, setMood] = useState("Qualquer rolê");
-  const [period, setPeriod] = useState("Hoje");
+  const [period, setPeriod] = useState("Qualquer dia");
   const [budget, setBudget] = useState("Qualquer preço");
   const [search, setSearch] = useState("");
   const navigate = useNavigate();
@@ -411,7 +530,13 @@ function Home() {
             </div>
           </div>
           <div className="hero-art">
-            <img src={catalog[0].image} alt="Público em um show noturno" />
+            <img
+              src={(catalog[0] ?? events[0]).image}
+              alt="Público em um show noturno"
+              onError={(event) => {
+                event.currentTarget.style.display = "none";
+              }}
+            />
             <div className="floating-note">
               <span className="pulse-dot"></span>
               <div>
@@ -526,7 +651,14 @@ function Home() {
                 key={venue.name}
                 style={{ animationDelay: `${index * 80}ms` }}
               >
-                <img src={venue.image} alt={venue.name} loading="lazy" />
+                <img
+                  src={venue.image}
+                  alt={venue.name}
+                  loading="lazy"
+                  onError={(error) => {
+                    error.currentTarget.style.display = "none";
+                  }}
+                />
                 <div className="venue-card-overlay">
                   <span>{venue.type}</span>
                   <strong>{venue.name}</strong>
@@ -540,12 +672,16 @@ function Home() {
           <div className="section-heading">
             <div>
               <span className="kicker">
-                {filtered.length
+                {loading || filtered.length
                   ? "Combina com você"
                   : "Tente outra combinação"}
               </span>
               <h2>
-                {filtered.length ? "O melhor da noite" : "Nada por aqui ainda"}
+                {loading
+                  ? "Carregando..."
+                  : filtered.length
+                    ? "O melhor da noite"
+                    : "Nada por aqui ainda"}
               </h2>
             </div>
             <Link to="/eventos" className="text-link">
@@ -553,7 +689,7 @@ function Home() {
             </Link>
           </div>
           <div className="event-grid">
-            {(loading ? catalog.slice(0, 3) : filtered.slice(0, 3)).map(
+            {filtered.slice(0, 3).map(
               (event, index) => (
                 <EventCard event={event} index={index} key={event.id} />
               ),
@@ -596,7 +732,11 @@ function Home() {
           </div>
           <div className="category-row">
             {categories.slice(1).map((item) => (
-              <Link key={item} to="/eventos" className="category-pill">
+              <Link
+                key={item}
+                to={`/eventos?categoria=${encodeURIComponent(item)}`}
+                className="category-pill"
+              >
                 {item}
               </Link>
             ))}
@@ -608,11 +748,12 @@ function Home() {
   );
 }
 function EventsPage() {
-  const { items, loading, error } = useCatalog();
-  const catalog = items.length ? items : events;
+  const { catalog, loading, error } = useCatalog();
   const [searchParams] = useSearchParams();
   const [term, setTerm] = useState(searchParams.get("q") ?? "");
-  const [category, setCategory] = useState("Todos");
+  const [category, setCategory] = useState(
+    searchParams.get("categoria") ?? "Todos",
+  );
   const results = catalog.filter(
     (event) =>
       `${event.title} ${event.venue} ${event.city}`
@@ -678,13 +819,41 @@ function EventsPage() {
     </>
   );
 }
+type CheckoutState = { event: EventItem; ticketIndex: number; quantity: number };
 function EventDetails() {
-  const { items, loading, error } = useCatalog();
-  const catalog = items.length ? items : events;
+  const { catalog, loading, error } = useCatalog();
   const { id } = useParams();
-  const event = catalog.find((item) => item.id === id) ?? catalog[0];
+  const event = catalog.find((item) => item.id === id);
+  const [ticketIndex, setTicketIndex] = useState(0);
   const [quantity, setQuantity] = useState(1);
   const navigate = useNavigate();
+  if (!event)
+    return (
+      <>
+        <Header />
+        <main className="details-page">
+          <Link to="/eventos" className="back-link">
+            ← Voltar para eventos
+          </Link>
+          <div className="empty-state">
+            <span className="kicker">
+              {loading ? "Um instante" : "Evento indisponível"}
+            </span>
+            <h1>
+              {loading
+                ? "Carregando evento..."
+                : error || "Este evento não foi encontrado ou já aconteceu."}
+            </h1>
+          </div>
+        </main>
+        <Footer />
+      </>
+    );
+  const tickets = ticketsOf(event);
+  const ticket = tickets[ticketIndex] ?? tickets[0];
+  const maxQuantity = ticket?.maxPerOrder ?? 0;
+  const soldOut = !ticket || maxQuantity < 1;
+  const safeQuantity = Math.min(Math.max(quantity, 1), Math.max(maxQuantity, 1));
   return (
     <>
       <Header />
@@ -692,14 +861,9 @@ function EventDetails() {
         <Link to="/eventos" className="back-link">
           ← Voltar para eventos
         </Link>
-        {loading && (
-          <div className="catalog-notice" role="status">
-            Atualizando disponibilidade...
-          </div>
-        )}
         {error && (
           <div className="catalog-notice" role="status">
-            {error}
+            {error} Exibindo a curadoria disponível.
           </div>
         )}
         <div className="detail-hero">
@@ -717,9 +881,8 @@ function EventDetails() {
             <span className="kicker">Sobre o evento</span>
             <h2>Uma noite para lembrar.</h2>
             <p>
-              Prepare-se para uma experiência única, com música, encontros e
-              aquela energia que só a noite sabe criar. Chegue cedo, encontre
-              sua turma e deixe o resto acontecer.
+              {event.description ??
+                "Prepare-se para uma experiência única, com música, encontros e aquela energia que só a noite sabe criar. Chegue cedo, encontre sua turma e deixe o resto acontecer."}
             </p>
             <div className="info-list">
               <div>
@@ -727,7 +890,7 @@ function EventDetails() {
                 <div>
                   <small>Local</small>
                   <strong>{event.venue}</strong>
-                  <p>Av. Brigadeiro Faria Lima, 166</p>
+                  <p>{event.address ?? event.city}</p>
                 </div>
               </div>
               <div>
@@ -735,77 +898,125 @@ function EventDetails() {
                 <div>
                   <small>Data e horário</small>
                   <strong>{event.date}</strong>
-                  <p>Abertura da casa às {event.time}</p>
+                  <p>Início às {event.time}</p>
                 </div>
               </div>
             </div>
           </section>
           <aside className="ticket-box">
             <span className="kicker">Escolha seu ingresso</span>
-            <div className="ticket-option">
-              <div>
-                <strong>Entrada antecipada</strong>
-                <small>Acesso à pista</small>
-              </div>
-              <strong>R$ {event.price},00</strong>
-            </div>
-            <div className="ticket-option">
-              <div>
-                <strong>VIP Experience</strong>
-                <small>Área exclusiva + welcome drink</small>
-              </div>
-              <strong>R$ 180,00</strong>
-            </div>
+            {tickets.map((option, index) => (
+              <button
+                type="button"
+                key={option.id ?? option.name}
+                className={
+                  index === ticketIndex ? "ticket-option active" : "ticket-option"
+                }
+                aria-pressed={index === ticketIndex}
+                disabled={option.maxPerOrder < 1}
+                onClick={() => {
+                  setTicketIndex(index);
+                  setQuantity(1);
+                }}
+              >
+                <div>
+                  <strong>{option.name}</strong>
+                  <small>
+                    {option.maxPerOrder < 1 ? "Esgotado" : option.description}
+                  </small>
+                </div>
+                <strong>{brl(option.price)}</strong>
+              </button>
+            ))}
+            {!tickets.length && (
+              <small className="secure-note">
+                Nenhum ingresso à venda no momento.
+              </small>
+            )}
             <div className="quantity-row">
               <span>Quantidade</span>
               <div className="stepper">
-                <button onClick={() => setQuantity(Math.max(1, quantity - 1))}>
+                <button
+                  aria-label="Diminuir quantidade"
+                  onClick={() => setQuantity(Math.max(1, safeQuantity - 1))}
+                >
                   −
                 </button>
-                <strong>{quantity}</strong>
-                <button onClick={() => setQuantity(Math.min(5, quantity + 1))}>
+                <strong>{safeQuantity}</strong>
+                <button
+                  aria-label="Aumentar quantidade"
+                  onClick={() =>
+                    setQuantity(Math.min(maxQuantity, safeQuantity + 1))
+                  }
+                >
                   +
                 </button>
               </div>
             </div>
             <div className="total-row">
-              <span>Total</span>
-              <strong>R$ {event.price * quantity},00</strong>
+              <span>Total{ticket?.fee ? " com taxa" : ""}</span>
+              <strong>
+                {brl(ticket ? (ticket.price + ticket.fee) * safeQuantity : 0)}
+              </strong>
             </div>
             <button
               className="primary-button full"
+              disabled={soldOut}
               onClick={() =>
-                navigate("/checkout", { state: { event, quantity } })
+                navigate("/checkout", {
+                  state: {
+                    event,
+                    ticketIndex: tickets.indexOf(ticket),
+                    quantity: safeQuantity,
+                  } satisfies CheckoutState,
+                })
               }
             >
-              Continuar <span>→</span>
+              {soldOut ? "Esgotado" : "Continuar"} <span>→</span>
             </button>
             <small className="secure-note">
-              ⌾ Compra segura · limite de 5 ingressos
+              ⌾ Compra segura · limite de 5 ingressos por evento
             </small>
           </aside>
         </div>
       </main>
+      <Footer />
     </>
   );
 }
 function Checkout() {
   const location = useLocation();
-  const state = location.state as
-    | { event?: EventItem; quantity?: number }
-    | undefined;
-  const event = state?.event ?? events[0];
-  const quantity = state?.quantity ?? 1;
+  const state = location.state as CheckoutState | null;
   const navigate = useNavigate();
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<"PIX" | "CREDIT_CARD">(
     "PIX",
   );
+  if (!state?.event)
+    return (
+      <>
+        <Header />
+        <main className="checkout-page">
+          <div className="empty-state">
+            <span className="kicker">Carrinho vazio</span>
+            <h1>Escolha um evento para continuar.</h1>
+            <Link to="/eventos" className="primary-button">
+              Ver eventos <span>→</span>
+            </Link>
+          </div>
+        </main>
+      </>
+    );
+  const { event, quantity } = state;
+  const ticket = ticketsOf(event)[state.ticketIndex] ?? ticketsOf(event)[0];
+  const subtotal = ticket.price * quantity;
+  const fees = ticket.fee * quantity;
+  const total = subtotal + fees;
   const submit = async (formEvent: FormEvent<HTMLFormElement>) => {
     formEvent.preventDefault();
     setError("");
-    if (!/^[0-9a-f-]{36}$/i.test(event.id) || !event.ticketTypeId) {
+    if (!ticket.id) {
       setError(
         "Este evento ainda está em modo de demonstração e não aceita reservas reais.",
       );
@@ -819,18 +1030,29 @@ function Checkout() {
         credentials: "include",
         body: JSON.stringify({
           eventId: event.id,
-          items: [{ ticketTypeId: event.ticketTypeId, quantity }],
+          items: [{ ticketTypeId: ticket.id, quantity }],
           paymentMethod,
         }),
       });
-      const data = (await response.json()) as { error?: string };
       if (response.status === 401) {
-        navigate("/login", { state: { returnTo: "/checkout" } });
+        navigate("/login", {
+          state: { returnTo: "/checkout", checkout: state },
+        });
         return;
       }
-      if (!response.ok)
-        throw new Error(data.error ?? "Não foi possível criar sua reserva.");
-      navigate("/pagamento/pendente");
+      const data = await readJson<{
+        error?: string;
+        order?: { order_number: string; total: string };
+      }>(response);
+      if (!response.ok || !data?.order)
+        throw new Error(data?.error ?? "Não foi possível criar sua reserva.");
+      navigate("/pagamento/pendente", {
+        state: {
+          orderNumber: data.order.order_number,
+          total: Number(data.order.total),
+          eventTitle: event.title,
+        },
+      });
     } catch (submitError) {
       setError(
         submitError instanceof Error
@@ -945,9 +1167,7 @@ function Checkout() {
               disabled={isSubmitting}
               className="primary-button full mobile-only"
             >
-              {isSubmitting
-                ? "Processando..."
-                : `Pagar R$ ${event.price * quantity},00`}
+              {isSubmitting ? "Processando..." : `Pagar ${brl(total)}`}
             </button>
           </form>
           <aside className="order-summary">
@@ -962,16 +1182,18 @@ function Checkout() {
               </div>
             </div>
             <div className="summary-line">
-              <span>{quantity}x Entrada antecipada</span>
-              <strong>R$ {event.price * quantity},00</strong>
+              <span>
+                {quantity}x {ticket.name}
+              </span>
+              <strong>{brl(subtotal)}</strong>
             </div>
             <div className="summary-line">
               <span>Taxa de serviço</span>
-              <strong>R$ 8,50</strong>
+              <strong>{brl(fees)}</strong>
             </div>
             <div className="summary-total">
               <span>Total</span>
-              <strong>R$ {event.price * quantity + 8.5},50</strong>
+              <strong>{brl(total)}</strong>
             </div>
             <button
               type="submit"
@@ -996,28 +1218,97 @@ function Checkout() {
     </>
   );
 }
-function Account() {
-  const [user, setUser] = useState<SessionUser | null>(null);
-  useEffect(() => {
-    fetch(apiUrl("/api/auth/me"), { credentials: "include" })
-      .then((response) => (response.ok ? response.json() : null))
-      .then((data: { user?: SessionUser } | null) =>
-        setUser(data?.user ?? null),
-      )
-      .catch(() => setUser(null));
-  }, []);
-  if (!user)
-    return (
+function PaymentPending() {
+  const state = useLocation().state as {
+    orderNumber?: string;
+    total?: number;
+    eventTitle?: string;
+  } | null;
+  return (
+    <>
+      <Header />
       <main className="page-content profile-page max-w-5xl mx-auto px-5 sm:px-8">
         <div className="empty-state">
-          <span className="kicker">Área privada</span>
-          <h1>Entre para acessar seus ingressos.</h1>
-          <Link to="/login" className="primary-button">
-            Entrar <span>→</span>
+          <span className="kicker">Reserva criada</span>
+          <h1>Aguardando pagamento.</h1>
+          {state?.orderNumber && (
+            <p>
+              Pedido <strong>{state.orderNumber}</strong>
+              {state.eventTitle && <> · {state.eventTitle}</>}
+              {state.total !== undefined && <> · {brl(state.total)}</>}
+            </p>
+          )}
+          <p>
+            Seus ingressos ficam reservados por 15 minutos e aparecem em “Meus
+            ingressos” assim que o pagamento for confirmado.
+          </p>
+          <Link to="/meus-ingressos" className="primary-button">
+            Meus ingressos <span>→</span>
           </Link>
         </div>
       </main>
+      <Footer />
+    </>
+  );
+}
+type OwnedTicket = {
+  id: string;
+  code: string;
+  status: string;
+  qrToken: string | null;
+  event: {
+    name: string;
+    start_at: string;
+    venue: { name: string; city: string } | null;
+  };
+  ticket_type: { name: string };
+  order: { order_number: string };
+};
+const ticketStatusLabels: Record<string, string> = {
+  USED: "Utilizado",
+  CANCELLED: "Cancelado",
+  REFUNDED: "Reembolsado",
+  EXPIRED: "Expirado",
+};
+function Account() {
+  const { user, loading } = useSession();
+  const [tickets, setTickets] = useState<OwnedTicket[] | null>(null);
+  const [error, setError] = useState("");
+  const [tab, setTab] = useState<"next" | "past">("next");
+  const [openTicket, setOpenTicket] = useState<string | null>(null);
+  const [mountedAt] = useState(() => Date.now());
+  useEffect(() => {
+    if (!user) return;
+    fetch(apiUrl("/api/tickets"), { credentials: "include" })
+      .then(async (response) => {
+        const data = response.ok
+          ? await readJson<{ tickets: OwnedTicket[] }>(response)
+          : null;
+        if (!data) throw new Error("Não foi possível carregar seus ingressos.");
+        setTickets(data.tickets);
+      })
+      .catch((requestError: unknown) =>
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : "Ingressos indisponíveis.",
+        ),
+      );
+  }, [user]);
+  if (!user)
+    return (
+      <PrivateNotice
+        loading={loading}
+        title="Entre para acessar seus ingressos."
+      />
     );
+  const now = mountedAt;
+  const visible = (tickets ?? []).filter((ticket) => {
+    const upcoming =
+      ticket.status === "ACTIVE" &&
+      new Date(ticket.event.start_at).getTime() >= now - 12 * 60 * 60 * 1000;
+    return tab === "next" ? upcoming : !upcoming;
+  });
   return (
     <>
       <Header />
@@ -1028,74 +1319,169 @@ function Account() {
           <p>O próximo momento já tem endereço.</p>
         </div>
         <div className="account-tabs">
-          <button className="active">Próximos</button>
-          <button>Histórico</button>
+          <button
+            className={tab === "next" ? "active" : ""}
+            onClick={() => setTab("next")}
+          >
+            Próximos
+          </button>
+          <button
+            className={tab === "past" ? "active" : ""}
+            onClick={() => setTab("past")}
+          >
+            Histórico
+          </button>
         </div>
-        <div className="ticket-list">
-          <div className="owned-ticket">
-            <div className="ticket-image">
-              <img src={events[0].image} alt="" />
-              <span>
-                29
-                <br />
-                <small>AGO</small>
-              </span>
-            </div>
-            <div className="owned-ticket-info">
-              <span className="kicker">Eletrônica · São Paulo</span>
-              <h3>{events[0].title}</h3>
-              <p>
-                {events[0].date} · {events[0].time}
-                <br />
-                {events[0].venue}
-              </p>
-              <div>
-                <button className="outline-button">Ver ingresso</button>
-                <button className="download-link">↓ Baixar PDF</button>
-              </div>
-            </div>
-            <div className="qr-placeholder">
-              ▦<small>QR CODE</small>
-            </div>
+        {error && (
+          <div className="catalog-notice" role="status">
+            {error}
           </div>
+        )}
+        <div className="ticket-list">
+          {tickets === null && !error && (
+            <div className="results-label">Carregando ingressos...</div>
+          )}
+          {tickets !== null && !visible.length && (
+            <div className="empty-state">
+              <h3>
+                {tab === "next"
+                  ? "Nenhum ingresso para os próximos eventos."
+                  : "Seu histórico ainda está vazio."}
+              </h3>
+              {tab === "next" && (
+                <Link to="/eventos" className="primary-button">
+                  Descobrir eventos <span>↗</span>
+                </Link>
+              )}
+            </div>
+          )}
+          {visible.map((ticket) => {
+            const date = new Date(ticket.event.start_at);
+            return (
+              <div className="owned-ticket" key={ticket.id}>
+                <div className="ticket-image">
+                  <span>
+                    {String(date.getDate()).padStart(2, "0")}
+                    <br />
+                    <small>
+                      {date
+                        .toLocaleDateString("pt-BR", { month: "short" })
+                        .replace(".", "")
+                        .toUpperCase()}
+                    </small>
+                  </span>
+                </div>
+                <div className="owned-ticket-info">
+                  <span className="kicker">
+                    {ticket.ticket_type.name}
+                    {ticket.event.venue && <> · {ticket.event.venue.city}</>}
+                  </span>
+                  <h3>{ticket.event.name}</h3>
+                  <p>
+                    {date.toLocaleDateString("pt-BR")} ·{" "}
+                    {date.toLocaleTimeString("pt-BR", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                    <br />
+                    {ticket.event.venue?.name ?? "Local a confirmar"} ·{" "}
+                    {ticket.code}
+                  </p>
+                  {ticket.qrToken ? (
+                    <div>
+                      <button
+                        className="outline-button"
+                        onClick={() =>
+                          setOpenTicket(
+                            openTicket === ticket.id ? null : ticket.id,
+                          )
+                        }
+                      >
+                        {openTicket === ticket.id
+                          ? "Ocultar QR Code"
+                          : "Ver ingresso"}
+                      </button>
+                    </div>
+                  ) : (
+                    <p>{ticketStatusLabels[ticket.status] ?? ticket.status}</p>
+                  )}
+                </div>
+                <div className="qr-placeholder">
+                  {ticket.qrToken && openTicket === ticket.id ? (
+                    <QRCodeSVG value={ticket.qrToken} size={120} />
+                  ) : (
+                    <>
+                      ▦<small>QR CODE</small>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </main>
     </>
   );
 }
+const googleErrors: Record<string, string> = {
+  google_unavailable: "Login Google ainda não foi configurado.",
+  google_invalid: "O Google não confirmou seu login. Tente novamente.",
+  google_profile: "Sua conta Google não compartilhou nome e e-mail.",
+};
 function Login({ signup = false }: { signup?: boolean }) {
   const [error, setError] = useState("");
   const [password, setPassword] = useState("");
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
-  const [googleError] = useState(() =>
-    new URLSearchParams(window.location.search).get("error") ===
-    "google_unavailable"
-      ? "Login Google ainda não foi configurado."
-      : "",
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [googleError] = useState(
+    () =>
+      googleErrors[
+        new URLSearchParams(window.location.search).get("error") ?? ""
+      ] ?? "",
   );
   const navigate = useNavigate();
+  const location = useLocation();
+  const redirect = location.state as {
+    returnTo?: string;
+    checkout?: CheckoutState;
+  } | null;
   const startGoogleLogin = () => {
-    window.location.href = "/api/auth/google";
+    window.location.href = apiUrl("/api/auth/google");
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!email.includes("@")) return setError("Digite um e-mail válido.");
+    if (signup && name.trim().length < 2)
+      return setError("Digite seu nome completo.");
+    if (!/^\S+@\S+\.\S+$/.test(email))
+      return setError("Digite um e-mail válido.");
     if (password.length < 8)
       return setError("A senha precisa ter pelo menos 8 caracteres.");
     setError("");
-    const response = await fetch(apiUrl(`/api/auth/${signup ? "register" : "login"}`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify(
-        signup ? { name, email, password } : { email, password },
-      ),
-    });
-    const data = (await response.json()) as { error?: string };
-    if (!response.ok)
-      return setError(data.error ?? "Não foi possível concluir.");
-    navigate("/eventos");
+    setIsSubmitting(true);
+    try {
+      const response = await fetch(
+        apiUrl(`/api/auth/${signup ? "register" : "login"}`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(
+            signup ? { name, email, password } : { email, password },
+          ),
+        },
+      );
+      const data = await readJson<{ error?: string }>(response);
+      if (!response.ok)
+        return setError(data?.error ?? "Não foi possível concluir.");
+      navigate(redirect?.returnTo ?? "/eventos", {
+        state: redirect?.checkout,
+      });
+    } catch {
+      setError("Sem conexão com o servidor. Tente novamente.");
+    } finally {
+      setIsSubmitting(false);
+    }
   };
   return (
     <>
@@ -1169,12 +1555,17 @@ function Login({ signup = false }: { signup?: boolean }) {
               {error}
             </small>
           )}
-          <button className="primary-button full">
-            {signup ? "Criar minha conta" : "Entrar"} <span>→</span>
+          <button className="primary-button full" disabled={isSubmitting}>
+            {isSubmitting
+              ? "Aguarde..."
+              : signup
+                ? "Criar minha conta"
+                : "Entrar"}{" "}
+            <span>→</span>
           </button>
           <small className="auth-switch">
             {signup ? "Já tem uma conta? " : "Ainda não tem uma conta? "}
-            <Link to={signup ? "/login" : "/cadastro"}>
+            <Link to={signup ? "/login" : "/cadastro"} state={redirect}>
               {signup ? "Entrar" : "Criar conta"}
             </Link>
           </small>
@@ -1184,32 +1575,17 @@ function Login({ signup = false }: { signup?: boolean }) {
   );
 }
 function Profile() {
-  const [user, setUser] = useState<SessionUser | null>(null);
+  const { user, loading } = useSession();
   const navigate = useNavigate();
-  useEffect(() => {
-    fetch(apiUrl("/api/auth/me"), { credentials: "include" })
-      .then((response) => (response.ok ? response.json() : null))
-      .then((data: { user?: SessionUser } | null) =>
-        setUser(data?.user ?? null),
-      )
-      .catch(() => setUser(null));
-  }, []);
   const logout = async () => {
-    await fetch(apiUrl("/api/auth/logout"), { method: "POST", credentials: "include" });
+    await fetch(apiUrl("/api/auth/logout"), {
+      method: "POST",
+      credentials: "include",
+    }).catch(() => undefined);
     navigate("/");
   };
   if (!user)
-    return (
-      <main className="page-content profile-page max-w-5xl mx-auto px-5 sm:px-8">
-        <div className="empty-state">
-          <span className="kicker">Área privada</span>
-          <h1>Entre para ver seu perfil.</h1>
-          <Link to="/login" className="primary-button">
-            Entrar <span>→</span>
-          </Link>
-        </div>
-      </main>
-    );
+    return <PrivateNotice loading={loading} title="Entre para ver seu perfil." />;
   return (
     <>
       <Header />
@@ -1264,6 +1640,7 @@ function App() {
         <Route path="/eventos" element={<EventsPage />} />
         <Route path="/eventos/:id" element={<EventDetails />} />
         <Route path="/checkout" element={<Checkout />} />
+        <Route path="/pagamento/pendente" element={<PaymentPending />} />
         <Route path="/meus-ingressos" element={<Account />} />
         <Route path="/perfil" element={<Profile />} />
         <Route path="/login" element={<Login />} />
@@ -1274,4 +1651,3 @@ function App() {
   );
 }
 export default App;
-
