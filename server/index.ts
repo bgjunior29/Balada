@@ -10,6 +10,7 @@ import express, {
 } from "express";
 import helmet from "helmet";
 import { OAuth2Client } from "google-auth-library";
+import { registerAdminRoutes } from "./admin.js";
 import { z } from "zod";
 import {
   Prisma,
@@ -47,11 +48,15 @@ const googleClient = new OAuth2Client(
   googleRedirectUri,
 );
 
+// Na Railway a API fica atrás de um proxy; sem isso request.ip seria o do proxy
+// e o limite de tentativas de login valeria para todo mundo junto.
+if (isProduction) app.set("trust proxy", 1);
 app.use(helmet());
 app.use(
   cors({
     origin: frontendOrigin,
     credentials: true,
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
   }),
 );
 app.use(express.json({ limit: "100kb" }));
@@ -119,23 +124,69 @@ async function setSession(response: Response, userId: string) {
   });
 }
 
-const registerSchema = z.object({
-  name: z.string().trim().min(2).max(150),
-  email: z
+const emailField = z
+  .string()
+  .trim()
+  .email("Digite um e-mail válido.")
+  .max(255)
+  .transform((value) => value.toLowerCase());
+const nameField = z
+  .string()
+  .trim()
+  .min(2, "Digite seu nome completo.")
+  .max(150, "Nome muito longo.");
+const phoneField = z.preprocess(
+  (value) => (typeof value === "string" && !value.trim() ? undefined : value),
+  z
     .string()
-    .email()
-    .max(255)
-    .transform((value) => value.toLowerCase()),
-  phone: z.string().trim().min(8).max(30).optional(),
-  password: z.string().min(8).max(72),
+    .trim()
+    .regex(/^[0-9()+\s-]{8,30}$/, "Telefone inválido.")
+    .optional(),
+);
+const registerSchema = z.object({
+  name: nameField,
+  email: emailField,
+  phone: phoneField,
+  password: z
+    .string()
+    .min(8, "A senha precisa ter pelo menos 8 caracteres.")
+    .max(72, "A senha pode ter no máximo 72 caracteres.")
+    .regex(/[A-Za-z]/, "Use pelo menos uma letra na senha.")
+    .regex(/[0-9]/, "Use pelo menos um número na senha."),
 });
 const loginSchema = z.object({
-  email: z
-    .string()
-    .email()
-    .transform((value) => value.toLowerCase()),
-  password: z.string().min(1).max(72),
+  email: emailField,
+  password: z.string().min(1, "Digite sua senha.").max(72),
 });
+const profileSchema = z.object({ name: nameField, phone: phoneField });
+
+// Limite simples de tentativas de login por IP + e-mail (memória do processo).
+const loginFailures = new Map<string, { count: number; until: number }>();
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 8;
+function loginBlocked(key: string) {
+  const entry = loginFailures.get(key);
+  if (!entry) return false;
+  if (entry.until < Date.now()) {
+    loginFailures.delete(key);
+    return false;
+  }
+  return entry.count >= LOGIN_MAX_FAILURES;
+}
+function registerLoginFailure(key: string) {
+  const entry = loginFailures.get(key);
+  if (!entry || entry.until < Date.now())
+    loginFailures.set(key, { count: 1, until: Date.now() + LOGIN_WINDOW_MS });
+  else entry.count += 1;
+}
+
+// Só aceita caminhos internos do site como destino depois do login.
+const safeReturnTo = (value: unknown) =>
+  typeof value === "string" && /^\/(?!\/)[\w\-/?=&%.#]*$/.test(value)
+    ? value
+    : "/eventos";
+const oauthCookie = "balada_oauth";
+const loginError = (code: string) => `${frontendOrigin}/login?error=${code}`;
 const reservationSchema = z.object({
   eventId: z.string().uuid(),
   paymentMethod: z
@@ -155,39 +206,64 @@ const reservationSchema = z.object({
 app.get("/api/health", (_request, response) =>
   response.json({ ok: true, service: "balada-api" }),
 );
-app.get("/api/auth/google", (_request, response) => {
+app.get("/api/auth/providers", (_request, response) =>
+  response.json({ google: Boolean(googleClientId && googleClientSecret) }),
+);
+app.get("/api/auth/google", (request, response) => {
   if (!googleClientId || !googleClientSecret)
-    return response
-      .status(503)
-      .json({ error: "Login Google ainda não configurado." });
+    return response.redirect(loginError("google_unavailable"));
+  // O "state" amarra a volta do Google a este navegador (proteção contra CSRF)
+  // e carrega a página para onde a pessoa volta depois do login.
+  const nonce = newToken();
+  const returnTo = safeReturnTo(request.query.returnTo);
+  response.cookie(oauthCookie, nonce, {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: "lax",
+    maxAge: 10 * 60 * 1000,
+    path: "/api/auth/google",
+  });
   return response.redirect(
     googleClient.generateAuthUrl({
-      access_type: "offline",
       scope: ["openid", "email", "profile"],
       prompt: "select_account",
+      state: `${nonce}.${Buffer.from(returnTo).toString("base64url")}`,
     }),
   );
 });
-app.get("/api/auth/google/callback", async (request, response, next) => {
+app.get("/api/auth/google/callback", async (request, response) => {
   try {
+    const expectedNonce = request.cookies[oauthCookie] as string | undefined;
+    response.clearCookie(oauthCookie, { path: "/api/auth/google" });
+    if (!googleClientId || !googleClientSecret)
+      return response.redirect(loginError("google_unavailable"));
+    if (request.query.error === "access_denied")
+      return response.redirect(loginError("google_cancelled"));
+    const [nonce = "", encodedReturn = ""] = String(
+      request.query.state ?? "",
+    ).split(".");
     if (
-      !googleClientId ||
-      !googleClientSecret ||
-      typeof request.query.code !== "string"
+      !expectedNonce ||
+      nonce.length !== expectedNonce.length ||
+      !crypto.timingSafeEqual(Buffer.from(nonce), Buffer.from(expectedNonce))
     )
-      return response.redirect(
-        `${frontendOrigin}/login?error=google_unavailable`,
-      );
+      return response.redirect(loginError("google_expired"));
+    const returnTo = safeReturnTo(
+      Buffer.from(encodedReturn, "base64url").toString(),
+    );
+    if (typeof request.query.code !== "string")
+      return response.redirect(loginError("google_invalid"));
     const { tokens } = await googleClient.getToken(request.query.code);
     if (!tokens.id_token)
-      return response.redirect(`${frontendOrigin}/login?error=google_invalid`);
+      return response.redirect(loginError("google_invalid"));
     const ticket = await googleClient.verifyIdToken({
       idToken: tokens.id_token,
       audience: googleClientId,
     });
     const profile = ticket.getPayload();
-    if (!profile?.sub || !profile.email || !profile.name)
-      return response.redirect(`${frontendOrigin}/login?error=google_profile`);
+    if (!profile?.sub || !profile.email || !profile.email_verified)
+      return response.redirect(loginError("google_profile"));
+    const profileName = profile.name ?? profile.email.split("@")[0];
     const googleEmail = profile.email.toLowerCase();
     const user = await prisma.$transaction(async (tx) => {
       const account = await tx.user_accounts.findFirst({
@@ -225,13 +301,13 @@ app.get("/api/auth/google/callback", async (request, response, next) => {
       return tx.users.upsert({
         where: { email: googleEmail },
         update: {
-          name: profile.name!,
+          name: profileName,
           avatar_url: profile.picture,
           email_verified_at: new Date(),
         },
         create: {
-          name: profile.name!,
-          email: profile.email!.toLowerCase(),
+          name: profileName,
+          email: googleEmail,
           avatar_url: profile.picture,
           status: UserStatus.ACTIVE,
           email_verified_at: new Date(),
@@ -245,10 +321,13 @@ app.get("/api/auth/google/callback", async (request, response, next) => {
         },
       });
     });
+    if (user.status !== UserStatus.ACTIVE)
+      return response.redirect(loginError("account_blocked"));
     await setSession(response, user.id);
-    return response.redirect(`${frontendOrigin}/eventos`);
+    return response.redirect(`${frontendOrigin}${returnTo}`);
   } catch (error) {
-    return next(error);
+    console.error("Falha no login Google:", error);
+    return response.redirect(loginError("google_failed"));
   }
 });
 app.post("/api/auth/register", async (request, response, next) => {
@@ -261,15 +340,25 @@ app.post("/api/auth/register", async (request, response, next) => {
       return response
         .status(409)
         .json({ error: "Este e-mail já está cadastrado." });
-    const user = await prisma.users.create({
-      data: {
-        name: input.name,
-        email: input.email,
-        phone: input.phone,
-        password_hash: await bcrypt.hash(input.password, 12),
-        status: UserStatus.ACTIVE,
-      },
-    });
+    const user = await prisma.users
+      .create({
+        data: {
+          name: input.name,
+          email: input.email,
+          phone: input.phone,
+          password_hash: await bcrypt.hash(input.password, 12),
+          status: UserStatus.ACTIVE,
+        },
+      })
+      .catch((error: unknown) => {
+        // Dois cadastros simultâneos com o mesmo e-mail.
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === "P2002"
+        )
+          throw new ApiError(409, "Este e-mail já está cadastrado.");
+        throw error;
+      });
     await setSession(response, user.id);
     return response.status(201).json({ user: publicUser(user) });
   } catch (error) {
@@ -279,15 +368,29 @@ app.post("/api/auth/register", async (request, response, next) => {
 app.post("/api/auth/login", async (request, response, next) => {
   try {
     const input = loginSchema.parse(request.body);
+    const limitKey = `${request.ip}:${input.email}`;
+    if (loginBlocked(limitKey))
+      return response.status(429).json({
+        error: "Muitas tentativas. Aguarde 15 minutos e tente de novo.",
+      });
     const user = await prisma.users.findUnique({
       where: { email: input.email },
+      include: { accounts: { select: { provider: true } } },
     });
+    if (user && !user.password_hash && user.accounts.length)
+      return response.status(401).json({
+        error:
+          "Esta conta usa o login do Google. Clique em “Continuar com Google”.",
+      });
     if (
       !user ||
       !user.password_hash ||
       !(await bcrypt.compare(input.password, user.password_hash))
-    )
+    ) {
+      registerLoginFailure(limitKey);
       return response.status(401).json({ error: "E-mail ou senha inválidos." });
+    }
+    loginFailures.delete(limitKey);
     if (user.status !== UserStatus.ACTIVE)
       return response.status(403).json({ error: "Conta indisponível." });
     await setSession(response, user.id);
@@ -317,9 +420,41 @@ app.get(
     try {
       const user = await prisma.users.findUniqueOrThrow({
         where: { id: request.user!.id },
-        select: { id: true, name: true, email: true, role: true },
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          phone: true,
+          role: true,
+          avatar_url: true,
+          password_hash: true,
+          accounts: { select: { provider: true } },
+        },
       });
-      return response.json({ user });
+      const { password_hash, accounts, ...rest } = user;
+      return response.json({
+        user: {
+          ...rest,
+          hasPassword: Boolean(password_hash),
+          google: accounts.some((account) => account.provider === "GOOGLE"),
+        },
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+app.patch(
+  "/api/auth/me",
+  authenticate,
+  async (request: AuthRequest, response, next) => {
+    try {
+      const input = profileSchema.parse(request.body);
+      const user = await prisma.users.update({
+        where: { id: request.user!.id },
+        data: { name: input.name, phone: input.phone ?? null },
+      });
+      return response.json({ user: publicUser(user) });
     } catch (error) {
       return next(error);
     }
@@ -341,6 +476,10 @@ app.get("/api/events", async (_request, response, next) => {
       orderBy: { start_at: "asc" },
       include: {
         venue: true,
+        artists: {
+          orderBy: { position: "asc" },
+          select: { artist: { select: { name: true } } },
+        },
         ticket_types: {
           where: { status: "ACTIVE" },
           select: {
@@ -858,6 +997,13 @@ class ApiError extends Error {
     super(message);
   }
 }
+registerAdminRoutes({
+  app,
+  prisma,
+  authenticate: authenticate as express.RequestHandler,
+  requireRole,
+  fail: (statusCode, message) => new ApiError(statusCode, message),
+});
 app.use(
   (
     error: unknown,

@@ -15,7 +15,9 @@
     "db:studio": "prisma studio",
     "api:dev": "tsx watch server/index.ts",
     "api:typecheck": "tsc -p tsconfig.server.json --noEmit",
-    "api:start": "tsx server/index.ts"
+    "api:start": "tsx server/index.ts",
+    "admin:promote": "tsx server/promote-admin.ts",
+    "user:reset-password": "tsx server/reset-password.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
